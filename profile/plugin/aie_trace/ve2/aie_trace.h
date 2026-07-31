@@ -107,6 +107,7 @@ namespace xdp {
     // -------------------------------------------------------------------------
     bool configureWindowedEventTrace(void* handle);
     void timerSynchronization(uint8_t startCol, uint8_t numCols, uint8_t numRows);
+    bool getPartitionRange(void* handle, uint8_t& startCol, uint8_t& numCols, uint8_t& numRows);
     void build2ChannelBroadcastNetwork(void* handle, uint8_t broadcastId1,
                                        uint8_t broadcastId2, XAie_Events event);
     void reset2ChannelBroadcastNetwork(void* handle, uint8_t broadcastId1,
@@ -131,6 +132,12 @@ namespace xdp {
                           const uint8_t channel = 0);
     void modifyEvents(module_type type, io_type subtype, const std::string metricSet,
                       uint8_t channel, std::vector<XAie_Events>& events);
+
+    // Fixed broadcast channels for the trace start network. The XDNA flow has
+    // no xaiefal resource manager to reserve them, so they match the values
+    // used by the client flow (see client/resources_def.h).
+    static constexpr uint8_t traceStartBroadcastChId1 = 6;
+    static constexpr uint8_t traceStartBroadcastChId2 = 7;
 
     XAie_DevInst aieDevInst = {0};
     std::unique_ptr<aie::VE2Transaction> tranxHandler;

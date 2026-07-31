@@ -1360,11 +1360,6 @@ namespace xdp {
       return false;
     }
     
-    // XDNA path has no xaiefal broadcast reservation; use fixed channels (see
-    // client/resources_def.h traceStartBroadcastChId1 / traceStartBroadcastChId2).
-    const uint8_t traceStartBroadcastChId1 = 6;
-    const uint8_t traceStartBroadcastChId2 = 7;
-
     // Define trace start events for different module types
     XAie_Events shimTraceStartEvent = (XAie_Events) (XAIE_EVENT_BROADCAST_A_0_PL + traceStartBroadcastChId2);
     XAie_Events memTileTraceStartEvent = (XAie_Events)(XAIE_EVENT_BROADCAST_0_MEM_TILE + traceStartBroadcastChId1);
@@ -1452,10 +1447,6 @@ namespace xdp {
       return false;
     }
 
-    // XDNA: fixed broadcast IDs for trace-start network (matches client/resources_def.h).
-    const uint8_t traceStartBroadcastChId1 = 6;
-    const uint8_t traceStartBroadcastChId2 = 7;
-    
     // Get channel configurations (memory and interface tiles)
     auto configChannel0 = metadata->getConfigChannel0();
     auto configChannel1 = metadata->getConfigChannel1();
@@ -1483,6 +1474,17 @@ namespace xdp {
       xrt_core::message::send(severity_level::info, "XRT",
           "Synchronizing AIE timers so trace and ML timeline share a time domain.");
       timerSynchronization(startCol, numCols, metadataReader->getNumRows());
+
+      // Windowed trace programs its own start events on the same channels
+      m_trace_start_broadcast = xrt_core::config::get_aie_trace_settings_trace_start_broadcast()
+                                && (startType != "layer");
+      if (m_trace_start_broadcast) {
+        xrt_core::message::send(severity_level::info, "XRT",
+            "Starting all AIE trace modules simultaneously using a broadcast network.");
+        coreTraceStartEvent          = (XAie_Events)(XAIE_EVENT_BROADCAST_0_CORE     + traceStartBroadcastChId1);
+        memoryTileTraceStartEvent    = (XAie_Events)(XAIE_EVENT_BROADCAST_0_MEM_TILE + traceStartBroadcastChId1);
+        interfaceTileTraceStartEvent = (XAie_Events)(XAIE_EVENT_BROADCAST_A_0_PL     + traceStartBroadcastChId2);
+      }
     }
 
     // Using user event for trace end to enable flushing
@@ -1904,7 +1906,6 @@ namespace xdp {
       // Add config info to static database
       // NOTE: Do not access cfgTile after this
       (db->getStaticInfo()).addAIECfgTile(deviceId, cfgTile);
-      xrt_core::message::send(severity_level::info, "XRT", "Debugging XDP: after (db->getStaticInfo()).addAIECfgTile");  
     }  // For tiles
 
     // Report and store trace events per tile
@@ -1915,9 +1916,7 @@ namespace xdp {
     }
 
     if (m_trace_start_broadcast) {
-      xrt_core::message::send(severity_level::info, "XRT", "before build2ChannelBroadcastNetwork");  
       build2ChannelBroadcastNetwork(handle, traceStartBroadcastChId1, traceStartBroadcastChId2, interfaceTileTraceStartEvent);
-      xrt_core::message::send(severity_level::info, "XRT", "before XAie_EventGenerate");
       XAie_EventGenerate(&aieDevInst, XAie_TileLoc(startCol, 0), XAIE_PL_MOD,  interfaceTileTraceStartEvent);
       reset2ChannelBroadcastNetwork(handle, traceStartBroadcastChId1, traceStartBroadcastChId2);
     }
@@ -2016,8 +2015,8 @@ namespace xdp {
   {
     // Reuse the fixed trace-start channels: the network is torn down below
     // before any other use of these channels is programmed.
-    const uint8_t broadcastId1 = 6;
-    const uint8_t broadcastId2 = 7;
+    const uint8_t broadcastId1 = traceStartBroadcastChId1;
+    const uint8_t broadcastId2 = traceStartBroadcastChId2;
 
     aie::trace::build2ChannelBroadcastNetwork(&aieDevInst, metadata, broadcastId1, broadcastId2,
                                               XAIE_EVENT_COMBO_EVENT_0_PL, startCol, numCols, numRows);
@@ -2077,92 +2076,49 @@ namespace xdp {
   }
 
   /***************************************************************************
-   * Build broadcast network using specified channels 
+   * Get the tile range covered by the current hardware context
+   ***************************************************************************/
+  bool AieTrace_VE2Impl::getPartitionRange(void* hwCtxImpl, uint8_t& startCol,
+                                           uint8_t& numCols, uint8_t& numRows)
+  {
+    boost::property_tree::ptree aiePartitionPt = xdp::aie::getAIEPartitionInfo(hwCtxImpl);
+    if (aiePartitionPt.empty())
+      return false;
+
+    auto metadataReader = (VPDatabase::Instance()->getStaticInfo()).getAIEmetadataReader(metadata->getDeviceID());
+    if (!metadataReader)
+      return false;
+
+    // Currently, assuming only one Hw Context is alive at a time
+    // NOTE: tiles are programmed with the partition column shift applied, so
+    //       the range always starts at the first column of the partition.
+    startCol = 0;
+    numCols  = static_cast<uint8_t>(aiePartitionPt.back().second.get<uint64_t>("num_cols"));
+    numRows  = metadataReader->getNumRows();
+    return true;
+  }
+
+  /***************************************************************************
+   * Build broadcast network using specified channels
+   *
+   * NOTE: The XDNA flow has no resource manager to reserve the channels, so
+   * they are passed in as fixed values. Everything else is shared with the
+   * ZOCL flow.
    ***************************************************************************/
   void AieTrace_VE2Impl::build2ChannelBroadcastNetwork(void *hwCtxImpl, uint8_t broadcastId1,
                                                        uint8_t broadcastId2, XAie_Events event)
   {
-    boost::property_tree::ptree aiePartitionPt = xdp::aie::getAIEPartitionInfo(hwCtxImpl);
-    if (aiePartitionPt.empty()) {
+    uint8_t startCol = 0;
+    uint8_t numCols  = 0;
+    uint8_t numRows  = 0;
+    if (!getPartitionRange(hwCtxImpl, startCol, numCols, numRows)) {
       xrt_core::message::send(severity_level::warning, "XRT",
                               "AIE trace: no partition info for trace-start broadcast; skipping broadcast network.");
       return;
     }
-    // Currently, assuming only one Hw Context is alive at a time
-    // uint8_t startCol = static_cast<uint8_t>(aiePartitionPt.front().second.get<uint64_t>("start_col"));
-    uint8_t startCol = 0;
-    // uint8_t numCols  = static_cast<uint8_t>(aiePartitionPt.front().second.get<uint64_t>("num_cols"));
-    uint8_t numCols = 36;
-    const uint8_t startColShift = metadata->getPartitionOverlayStartCols().front();
 
-    std::vector<uint8_t> maxRowAtCol(startCol + numCols, 0);
-    for (auto& tileMetric : metadata->getConfigMetrics()) {
-      auto tile       = tileMetric.first;
-      auto col        = tile.col;
-      auto row        = tile.row;
-      maxRowAtCol[startCol + col] = std::max(maxRowAtCol[col], (uint8_t)row);
-    }
-
-    XAie_Events bcastEvent2_PL = static_cast<XAie_Events>(XAIE_EVENT_BROADCAST_A_0_PL + broadcastId2);
-    XAie_EventBroadcast(&aieDevInst, XAie_TileLoc(startCol, 0), XAIE_PL_MOD, broadcastId2, event);
-
-    for (uint8_t col = startCol; col < (startCol + numCols); col++) {
-      for (uint8_t row = 0; row <= maxRowAtCol[col]; row++) {
-        module_type tileType = aie::getModuleType(row, metadata->getRowOffset());
-        auto loc = XAie_TileLoc(col, row);
-
-        // shim tile
-        if (tileType == module_type::shim) {
-          // first channel is only used to send north
-          if (col == startCol) {
-            XAie_EventBroadcast(&aieDevInst, loc, XAIE_PL_MOD, broadcastId1, event);
-          } else {
-            XAie_EventBroadcast(&aieDevInst, loc, XAIE_PL_MOD, broadcastId1, bcastEvent2_PL);
-          }
-          if (maxRowAtCol[col] != row) {
-            XAie_EventBroadcastBlockDir(&aieDevInst, loc, XAIE_PL_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                                        XAIE_EVENT_BROADCAST_SOUTH | XAIE_EVENT_BROADCAST_WEST | XAIE_EVENT_BROADCAST_EAST);
-          } else {
-            XAie_EventBroadcastBlockDir(
-                &aieDevInst, loc, XAIE_PL_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                XAIE_EVENT_BROADCAST_SOUTH | XAIE_EVENT_BROADCAST_WEST | XAIE_EVENT_BROADCAST_EAST | XAIE_EVENT_BROADCAST_NORTH);
-          }
-
-          // second channel is only used to send east
-          if (col != startCol + numCols - 1) {
-            XAie_EventBroadcastBlockDir(&aieDevInst, loc, XAIE_PL_MOD, XAIE_EVENT_SWITCH_A, broadcastId2,
-                                        XAIE_EVENT_BROADCAST_SOUTH | XAIE_EVENT_BROADCAST_WEST | XAIE_EVENT_BROADCAST_NORTH);
-          } else {
-            XAie_EventBroadcastBlockDir(&aieDevInst, loc, XAIE_PL_MOD, XAIE_EVENT_SWITCH_A, broadcastId2,
-                                        XAIE_EVENT_BROADCAST_SOUTH | XAIE_EVENT_BROADCAST_WEST | XAIE_EVENT_BROADCAST_NORTH);
-          }
-        } 
-        
-        // mem tile
-        else if (tileType == module_type::mem_tile) {
-          if (maxRowAtCol[col] != row) {
-            XAie_EventBroadcastBlockDir(&aieDevInst, loc, XAIE_MEM_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                                        XAIE_EVENT_BROADCAST_SOUTH | XAIE_EVENT_BROADCAST_WEST | XAIE_EVENT_BROADCAST_EAST);
-          } else {
-            XAie_EventBroadcastBlockDir(
-                &aieDevInst, loc, XAIE_MEM_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                XAIE_EVENT_BROADCAST_SOUTH | XAIE_EVENT_BROADCAST_WEST | XAIE_EVENT_BROADCAST_EAST | XAIE_EVENT_BROADCAST_NORTH);
-          }
-        } 
-        
-        // core tile
-        else { 
-          if (maxRowAtCol[col] != row) {
-            XAie_EventBroadcastBlockDir(&aieDevInst, loc, XAIE_CORE_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                                        XAIE_EVENT_BROADCAST_SOUTH | XAIE_EVENT_BROADCAST_WEST | XAIE_EVENT_BROADCAST_EAST);
-          } else {
-            XAie_EventBroadcastBlockDir(
-                &aieDevInst, loc, XAIE_CORE_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                XAIE_EVENT_BROADCAST_SOUTH | XAIE_EVENT_BROADCAST_WEST | XAIE_EVENT_BROADCAST_EAST | XAIE_EVENT_BROADCAST_NORTH);
-          }
-        }
-      }
-    }
+    aie::trace::build2ChannelBroadcastNetwork(&aieDevInst, metadata, broadcastId1, broadcastId2,
+                                              event, startCol, numCols, numRows);
   }
 
   /***************************************************************************
@@ -2171,58 +2127,17 @@ namespace xdp {
   void AieTrace_VE2Impl::reset2ChannelBroadcastNetwork(void *hwCtxImpl, uint8_t broadcastId1,
                                                        uint8_t broadcastId2)
   {
-    boost::property_tree::ptree aiePartitionPt = xdp::aie::getAIEPartitionInfo(hwCtxImpl);
-    if (aiePartitionPt.empty()) {
+    uint8_t startCol = 0;
+    uint8_t numCols  = 0;
+    uint8_t numRows  = 0;
+    if (!getPartitionRange(hwCtxImpl, startCol, numCols, numRows)) {
       xrt_core::message::send(severity_level::warning, "XRT",
         "AIE trace: no partition info for trace-start broadcast reset; skipping.");
       return;
     }
-    // Currently, assuming only one Hw Context is alive at a time
-    //uint8_t startCol = static_cast<uint8_t>(aiePartitionPt.back().second.get<uint64_t>("start_col"));
-    uint8_t startCol = 0;
-    //uint8_t numCols  = static_cast<uint8_t>(aiePartitionPt.back().second.get<uint64_t>("num_cols"));
-    uint8_t numCols = 36;
-    const uint8_t startColShift = metadata->getPartitionOverlayStartCols().front();
 
-    std::vector<uint8_t> maxRowAtCol(startCol + numCols, 0);
-    for (auto& tileMetric : metadata->getConfigMetrics()) {
-      auto tile = tileMetric.first;
-      auto col        = tile.col;
-      auto row        = tile.row;
-      maxRowAtCol[startCol + col] = std::max(maxRowAtCol[col], (uint8_t)row);
-    }
-
-    XAie_EventBroadcastReset(&aieDevInst, XAie_TileLoc(startCol, 0), XAIE_PL_MOD, broadcastId2);
-
-    for (uint8_t col = startCol; col < (startCol + numCols); col++) {
-      for (uint8_t row = 0; row <= maxRowAtCol[col]; row++) {
-        module_type tileType = aie::getModuleType(row, metadata->getRowOffset());
-        auto loc = XAie_TileLoc(col, row);
-
-        // shim tile
-        if (tileType == module_type::shim) {
-          XAie_EventBroadcastReset(&aieDevInst, loc, XAIE_PL_MOD, broadcastId1);
-          XAie_EventBroadcastUnblockDir(&aieDevInst, loc, XAIE_PL_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                                      XAIE_EVENT_BROADCAST_ALL);
-          XAie_EventBroadcastUnblockDir(&aieDevInst, loc, XAIE_PL_MOD, XAIE_EVENT_SWITCH_A, broadcastId2,
-                                      XAIE_EVENT_BROADCAST_ALL);
-          XAie_EventBroadcastUnblockDir(&aieDevInst, loc, XAIE_PL_MOD, XAIE_EVENT_SWITCH_B, broadcastId2,
-                                      XAIE_EVENT_BROADCAST_ALL);
-        } 
-        
-        // mem tile
-        else if (tileType == module_type::mem_tile) {
-          XAie_EventBroadcastUnblockDir(&aieDevInst, loc, XAIE_MEM_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                                      XAIE_EVENT_BROADCAST_ALL);
-        } 
-        
-        // core tile
-        else {
-          XAie_EventBroadcastUnblockDir(&aieDevInst, loc, XAIE_CORE_MOD, XAIE_EVENT_SWITCH_A, broadcastId1,
-                                      XAIE_EVENT_BROADCAST_ALL);
-        }
-      }
-    }
+    aie::trace::reset2ChannelBroadcastNetwork(&aieDevInst, metadata, broadcastId1, broadcastId2,
+                                              startCol, numCols, numRows);
   }
 
   /****************************************************************************
