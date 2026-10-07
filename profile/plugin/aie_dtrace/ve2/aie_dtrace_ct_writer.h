@@ -259,6 +259,19 @@ private:
                    const std::string& outputPath);
 
   /**
+   * @brief Emit a probe's counter reads, collapsing consecutive registers into blocks
+   *
+   * A run of counters whose registers sit next to each other is read with one read_mem
+   * instead of one read_reg each. The result variable is named for the run's first
+   * counter, so its values land at that offset in the counter metadata list.
+   *
+   * @param ctFile Output stream positioned inside the probe body
+   * @param counters The probe's counters, in counter metadata order
+   */
+  void writeCounterReads(std::ofstream& ctFile,
+                         const std::vector<CTCounterInfo>& counters);
+
+  /**
    * @brief Format an address as a hex string
    * @param address The address to format
    * @return Formatted hex string (e.g., "0x0000037520")

@@ -429,6 +429,15 @@ std::vector<CTCounterInfo> AieDtraceCTWriter::filterCountersByColumn(
     }
   }
 
+  // writeCounterReads merges only counters that are adjacent in this list, so order by
+  // address: a metric set that appends a tile's counters in any other order would
+  // otherwise silently fall back to one read_reg each. The counter metadata is emitted
+  // from this same vector, so the reads and the names that identify them stay aligned.
+  std::sort(filtered.begin(), filtered.end(),
+            [](const CTCounterInfo& a, const CTCounterInfo& b) {
+              return a.address < b.address;
+            });
+
   return filtered;
 }
 
@@ -462,6 +471,33 @@ uint64_t AieDtraceCTWriter::getModuleBaseOffset(const std::string& module)
     return SHIM_TILE_BASE_OFFSET;
   else
     return CORE_MODULE_BASE_OFFSET;  // Default to core module
+}
+
+void AieDtraceCTWriter::writeCounterReads(std::ofstream& ctFile,
+                                          const std::vector<CTCounterInfo>& counters)
+{
+  // A read_reg costs 3 control words; a read_mem costs 5 plus one mem buffer word per
+  // counter, so a run of consecutive registers pays off from three counters up.
+  constexpr size_t minBlockRun = 3;
+
+  for (size_t i = 0; i < counters.size(); ) {
+    size_t run = 1;
+    while ((i + run) < counters.size()
+           && counters[i + run].address == counters[i + run - 1].address + sizeof(uint32_t))
+      run++;
+
+    if (run >= minBlockRun) {
+      ctFile << "    _" << i << " = read_mem("
+             << formatAddress(counters[i].address) << ", " << run << ")\n";
+    }
+    else {
+      for (size_t k = i; k < (i + run); k++)
+        ctFile << "    _" << k << " = read_reg("
+               << formatAddress(counters[k].address) << ")\n";
+    }
+
+    i += run;
+  }
 }
 
 std::string AieDtraceCTWriter::formatAddress(uint64_t address)
@@ -640,14 +676,9 @@ bool AieDtraceCTWriter::writeCTFile(const std::vector<ASMFileInfo>& asmFileInfoL
     ctFile << "{\n";
     ctFile << "    ts_" << asmFileInfo.asmId << " = timestamp32()\n";
 
-    // Write counter reads. Each counter is assigned a sequential result
-    // variable (_0, _1, _2, ...) so the dtrace JSON dump emits one key per
-    // counter ("_0", "_1", ...) in probe order; counter semantics are provided
-    // by the COUNTER_METADATA block above.
-    for (size_t i = 0; i < asmFileInfo.counters.size(); i++) {
-      ctFile << "    _" << i << " = read_reg("
-             << formatAddress(asmFileInfo.counters[i].address) << ")\n";
-    }
+    // Result variables are named for their position in the COUNTER_METADATA block above,
+    // which is what gives each value its counter semantics.
+    writeCounterReads(ctFile, asmFileInfo.counters);
 
     ctFile << "}\n\n";
   }
@@ -1190,13 +1221,9 @@ bool AieDtraceCTWriter::writeCounterCTFile(
     ctFile << "{\n";
     ctFile << "    ts_" << asmFileInfo.asmId << " = timestamp32()\n";
 
-    // Each counter is assigned a sequential result variable (_0, _1, _2, ...)
-    // so the dtrace JSON dump emits one key per counter ("_0", "_1", ...) in
-    // probe order; counter semantics live in the COUNTER_METADATA block above.
-    for (size_t i = 0; i < asmFileInfo.counters.size(); i++) {
-      const auto& ctr = asmFileInfo.counters[i];
-      ctFile << "    _" << i << " = read_reg(" << formatAddress(ctr.address) << ")\n";
-    }
+    // Result variables are named for their position in the COUNTER_METADATA block above,
+    // which is what gives each value its counter semantics.
+    writeCounterReads(ctFile, asmFileInfo.counters);
 
     ctFile << "}\n\n";
   }
